@@ -1,0 +1,16 @@
+{
+  "name": "chat-backend",
+  "version": "1.0.0",
+  "description": "WhatsApp-style chat backend (REST + Socket.IO realtime).",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node src/server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5",
+    "socket.io-client": "^4.8.4"
+  }
+}
