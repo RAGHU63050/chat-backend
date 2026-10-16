@@ -186,14 +186,27 @@ io.on('connection', async (socket) => {
   const user = socket.user;
   socket.join(user.id);
 
-  // Messages waiting for me become "delivered".
+  // Messages waiting for me become "delivered" — and each sender is told.
+  const senders = await store.pendingSenders(user.id);
   await store.markAllDelivered(user.id);
+  for (const s of senders) {
+    io.to(s).emit('message:delivered', { by: user.id });
+  }
   socket.broadcast.emit('presence', { userId: user.id, online: true });
 
   socket.on('message:send', async (payload, ack) => {
     const { to, text } = payload || {};
     if (!to || !text) return;
     const msg = await store.addMessage({ from: user.id, to, text });
+
+    // If the recipient is online right now, it is delivered instantly.
+    const room = io.sockets.adapter.rooms.get(to);
+    if (room && room.size > 0) {
+      await store.markAllDelivered(to);
+      msg.deliveredAt = Date.now();
+      io.to(user.id).emit('message:delivered', { by: to });
+    }
+
     io.to(to).emit('message:new', msg);
     if (typeof ack === 'function') ack(msg);
   });
