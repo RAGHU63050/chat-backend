@@ -59,14 +59,10 @@ app.post('/api/auth', async (req, res) => {
   const isNew = !user;
 
   if (!user) {
-    // New account
     user = await store.addUser(phone, name || phone, password);
   } else {
-    // Existing account — password MUST match
     if (!store.verifyPassword(password, user.passwordHash)) {
-      return res
-        .status(401)
-        .json({ error: 'Wrong password for this number.' });
+      return res.status(401).json({ error: 'Wrong password for this number.' });
     }
     if (name && name !== user.name) {
       await store.updateUserName(user.id, name);
@@ -88,15 +84,42 @@ async function auth(req, res, next) {
 
 app.get('/api/me', auth, (req, res) => res.json({ user: publicUser(req.user) }));
 
-// Everyone except me — the contact list (includes lastSeen).
+// Everyone except me — the plain contact list.
 app.get('/api/users', auth, async (req, res) => {
   const users = (await store.allUsersExcept(req.user.id)).map(publicUser);
   res.json({ users });
 });
 
-// Full conversation with one peer.
+// Chat list — every contact with their last message + unread count.
+app.get('/api/chats', auth, async (req, res) => {
+  const me = req.user.id;
+  const [users, lasts, unread] = await Promise.all([
+    store.allUsersExcept(me),
+    store.lastMessages(me),
+    store.unreadCounts(me),
+  ]);
+  const chats = users.map((u) => ({
+    user: publicUser(u),
+    lastMessage: lasts[u.id] || null,
+    unread: unread[u.id] || 0,
+  }));
+  // Most recent conversation first.
+  chats.sort((a, b) => {
+    const ta = a.lastMessage ? a.lastMessage.createdAt : 0;
+    const tb = b.lastMessage ? b.lastMessage.createdAt : 0;
+    return tb - ta;
+  });
+  res.json({ chats });
+});
+
+// Full conversation with one peer — and mark their messages as read.
 app.get('/api/messages/:peerId', auth, async (req, res) => {
-  res.json({ messages: await store.conversation(req.user.id, req.params.peerId) });
+  const me = req.user.id;
+  const peer = req.params.peerId;
+  const messages = await store.conversation(me, peer);
+  await store.markRead(peer, me);
+  io.to(peer).emit('message:read', { by: me });
+  res.json({ messages });
 });
 
 // Send a message over plain HTTP (the app normally uses the socket).
@@ -108,6 +131,38 @@ app.post('/api/messages', auth, async (req, res) => {
   res.json({ message: msg });
 });
 
+// Edit a message.
+app.patch('/api/messages/:id', auth, async (req, res) => {
+  const text = String((req.body || {}).text || '').trim();
+  if (!text) return res.status(400).json({ error: 'text is required' });
+  const msg = await store.findMessageById(req.params.id);
+  if (!msg || msg.from !== req.user.id) {
+    return res.status(403).json({ error: 'not allowed' });
+  }
+  await store.editMessage(msg.id, text);
+  const updated = { ...msg, text, editedAt: Date.now() };
+  io.to(msg.to).emit('message:edited', updated);
+  res.json({ message: updated });
+});
+
+// Delete a message (for everyone).
+app.delete('/api/messages/:id', auth, async (req, res) => {
+  const msg = await store.findMessageById(req.params.id);
+  if (!msg || msg.from !== req.user.id) {
+    return res.status(403).json({ error: 'not allowed' });
+  }
+  await store.deleteMessage(msg.id);
+  io.to(msg.to).emit('message:deleted', { id: msg.id });
+  res.json({ ok: true });
+});
+
+// Search my messages.
+app.get('/api/search', auth, async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.json({ messages: [] });
+  res.json({ messages: await store.search(req.user.id, q) });
+});
+
 // ---------------------------------------------------------------------------
 // Realtime (Socket.IO)
 // ---------------------------------------------------------------------------
@@ -115,7 +170,6 @@ app.post('/api/messages', auth, async (req, res) => {
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
-// Authenticate every socket via the token sent in the handshake.
 io.use(async (socket, next) => {
   try {
     const token = socket.handshake.auth && socket.handshake.auth.token;
@@ -128,10 +182,12 @@ io.use(async (socket, next) => {
   }
 });
 
-io.on('connection', (socket) => {
+io.on('connection', async (socket) => {
   const user = socket.user;
-  socket.join(user.id); // private room named after the user id
+  socket.join(user.id);
 
+  // Messages waiting for me become "delivered".
+  await store.markAllDelivered(user.id);
   socket.broadcast.emit('presence', { userId: user.id, online: true });
 
   socket.on('message:send', async (payload, ack) => {
@@ -140,6 +196,12 @@ io.on('connection', (socket) => {
     const msg = await store.addMessage({ from: user.id, to, text });
     io.to(to).emit('message:new', msg);
     if (typeof ack === 'function') ack(msg);
+  });
+
+  socket.on('message:read', async ({ from }) => {
+    if (!from) return;
+    await store.markRead(from, user.id);
+    io.to(from).emit('message:read', { by: user.id });
   });
 
   socket.on('typing', ({ to, typing }) => {
@@ -153,7 +215,6 @@ io.on('connection', (socket) => {
   });
 });
 
-// Connect to MongoDB first, then start listening.
 store
   .connect()
   .then(() => {
