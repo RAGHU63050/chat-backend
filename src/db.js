@@ -1,6 +1,6 @@
-// MongoDB-backed data store.
-// Data lives in MongoDB Atlas (a real database), so it is NEVER lost when the
-// Render service restarts, redeploys, or spins down. Requires MONGODB_URI.
+// Sunli — MongoDB-backed data store.
+// Data lives in MongoDB Atlas, so it is NEVER lost when the service restarts.
+// Requires MONGODB_URI.
 
 const crypto = require('crypto');
 const { MongoClient } = require('mongodb');
@@ -27,13 +27,30 @@ async function connect() {
 
 const newToken = () => crypto.randomBytes(24).toString('hex');
 const newId = () => crypto.randomUUID();
-
 const noId = { projection: { _id: 0 } };
+
+// --- password hashing (scrypt, no external dependency) ---
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(String(password), salt, 64).toString('hex');
+  return `${salt}:${hash}`;
+}
+
+function verifyPassword(password, stored) {
+  if (!stored || !stored.includes(':')) return false;
+  const [salt, hash] = stored.split(':');
+  const test = crypto.scryptSync(String(password), salt, 64).toString('hex');
+  const a = Buffer.from(hash, 'hex');
+  const b = Buffer.from(test, 'hex');
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
 
 module.exports = {
   connect,
   newToken,
   newId,
+  hashPassword,
+  verifyPassword,
 
   findUserByPhone: (phone) => usersCol.findOne({ phone }, noId),
   findUserById: (id) => usersCol.findOne({ id }, noId),
@@ -41,13 +58,23 @@ module.exports = {
 
   allUsersExcept: (id) => usersCol.find({ id: { $ne: id } }, noId).toArray(),
 
-  async addUser(phone, name) {
-    const user = { id: newId(), phone, name, token: newToken(), createdAt: Date.now() };
+  async addUser(phone, name, password) {
+    const user = {
+      id: newId(),
+      phone,
+      name,
+      passwordHash: hashPassword(password),
+      token: newToken(),
+      lastSeen: Date.now(),
+      createdAt: Date.now(),
+    };
     await usersCol.insertOne(user);
     return user;
   },
 
   updateUserName: (id, name) => usersCol.updateOne({ id }, { $set: { name } }),
+  setLastSeen: (id, ts) => usersCol.updateOne({ id }, { $set: { lastSeen: ts } }),
+  setToken: (id, token) => usersCol.updateOne({ id }, { $set: { token } }),
 
   async addMessage({ from, to, text }) {
     const msg = { id: newId(), from, to, text, createdAt: Date.now() };
