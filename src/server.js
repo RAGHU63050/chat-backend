@@ -1,90 +1,167 @@
-// Sunli — MongoDB-backed data store.
-// Data lives in MongoDB Atlas, so it is NEVER lost when the service restarts.
-// Requires MONGODB_URI.
+// Sunli — chat backend (REST API + Socket.IO realtime).
+// Run:  npm install  &&  npm start   (listens on PORT, default 3000)
+// Data is stored in MongoDB Atlas (see db.js).
 
-const crypto = require('crypto');
-const { MongoClient } = require('mongodb');
+const http = require('http');
+const express = require('express');
+const cors = require('cors');
+const { Server } = require('socket.io');
+const store = require('./db');
 
-const URI = process.env.MONGODB_URI;
-if (!URI) {
-  console.error('MONGODB_URI is not set. Add it in your environment variables.');
-  process.exit(1);
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const PORT = process.env.PORT || 3000;
+
+const publicUser = (u) => ({
+  id: u.id,
+  phone: u.phone,
+  name: u.name,
+  lastSeen: u.lastSeen || 0,
+});
+
+// --- Only Indian mobile numbers are allowed (10 digits, starting 6-9) ---
+function normalizePhone(input) {
+  if (!input) return null;
+  let digits = String(input).replace(/\D/g, '');
+  if (digits.length === 12 && digits.startsWith('91')) digits = digits.slice(2);
+  if (digits.length === 11 && digits.startsWith('0')) digits = digits.slice(1);
+  if (!/^[6-9]\d{9}$/.test(digits)) return null;
+  return '+91' + digits;
 }
 
-const client = new MongoClient(URI);
-let usersCol;
-let messagesCol;
+// ---------------------------------------------------------------------------
+// REST API
+// ---------------------------------------------------------------------------
 
-async function connect() {
-  await client.connect();
-  const db = client.db(process.env.DB_NAME || 'chat');
-  usersCol = db.collection('users');
-  messagesCol = db.collection('messages');
-  await usersCol.createIndex({ phone: 1 }, { unique: true });
-  await usersCol.createIndex({ token: 1 });
-  await messagesCol.createIndex({ from: 1, to: 1, createdAt: 1 });
+app.get('/', (_req, res) => res.json({ ok: true, service: 'sunli' }));
+
+// Register (new number) or log in (existing number) — always with a password.
+app.post('/api/auth', async (req, res) => {
+  const body = req.body || {};
+  const phone = normalizePhone(body.phone);
+  const password = String(body.password || '');
+  const name = (body.name || '').trim();
+
+  if (!phone) {
+    return res
+      .status(400)
+      .json({ error: 'Enter a valid Indian mobile number (10 digits).' });
+  }
+  if (password.length < 4) {
+    return res
+      .status(400)
+      .json({ error: 'Password must be at least 4 characters.' });
+  }
+
+  let user = await store.findUserByPhone(phone);
+  const isNew = !user;
+
+  if (!user) {
+    // New account
+    user = await store.addUser(phone, name || phone, password);
+  } else {
+    // Existing account — password MUST match
+    if (!store.verifyPassword(password, user.passwordHash)) {
+      return res
+        .status(401)
+        .json({ error: 'Wrong password for this number.' });
+    }
+    if (name && name !== user.name) {
+      await store.updateUserName(user.id, name);
+      user.name = name;
+    }
+  }
+
+  res.json({ token: user.token, isNew, user: publicUser(user) });
+});
+
+// Bearer-token middleware.
+async function auth(req, res, next) {
+  const token = (req.headers.authorization || '').replace('Bearer ', '');
+  const user = await store.findUserByToken(token);
+  if (!user) return res.status(401).json({ error: 'unauthorized' });
+  req.user = user;
+  next();
 }
 
-const newToken = () => crypto.randomBytes(24).toString('hex');
-const newId = () => crypto.randomUUID();
-const noId = { projection: { _id: 0 } };
+app.get('/api/me', auth, (req, res) => res.json({ user: publicUser(req.user) }));
 
-// --- password hashing (scrypt, no external dependency) ---
-function hashPassword(password) {
-  const salt = crypto.randomBytes(16).toString('hex');
-  const hash = crypto.scryptSync(String(password), salt, 64).toString('hex');
-  return `${salt}:${hash}`;
-}
+// Everyone except me — the contact list (includes lastSeen).
+app.get('/api/users', auth, async (req, res) => {
+  const users = (await store.allUsersExcept(req.user.id)).map(publicUser);
+  res.json({ users });
+});
 
-function verifyPassword(password, stored) {
-  if (!stored || !stored.includes(':')) return false;
-  const [salt, hash] = stored.split(':');
-  const test = crypto.scryptSync(String(password), salt, 64).toString('hex');
-  const a = Buffer.from(hash, 'hex');
-  const b = Buffer.from(test, 'hex');
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
-}
+// Full conversation with one peer.
+app.get('/api/messages/:peerId', auth, async (req, res) => {
+  res.json({ messages: await store.conversation(req.user.id, req.params.peerId) });
+});
 
-module.exports = {
-  connect,
-  newToken,
-  newId,
-  hashPassword,
-  verifyPassword,
+// Send a message over plain HTTP (the app normally uses the socket).
+app.post('/api/messages', auth, async (req, res) => {
+  const { to, text } = req.body || {};
+  if (!to || !text) return res.status(400).json({ error: 'to and text are required' });
+  const msg = await store.addMessage({ from: req.user.id, to, text });
+  io.to(to).emit('message:new', msg);
+  res.json({ message: msg });
+});
 
-  findUserByPhone: (phone) => usersCol.findOne({ phone }, noId),
-  findUserById: (id) => usersCol.findOne({ id }, noId),
-  findUserByToken: (token) => usersCol.findOne({ token }, noId),
+// ---------------------------------------------------------------------------
+// Realtime (Socket.IO)
+// ---------------------------------------------------------------------------
 
-  allUsersExcept: (id) => usersCol.find({ id: { $ne: id } }, noId).toArray(),
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
 
-  async addUser(phone, name, password) {
-    const user = {
-      id: newId(),
-      phone,
-      name,
-      passwordHash: hashPassword(password),
-      token: newToken(),
-      lastSeen: Date.now(),
-      createdAt: Date.now(),
-    };
-    await usersCol.insertOne(user);
-    return user;
-  },
+// Authenticate every socket via the token sent in the handshake.
+io.use(async (socket, next) => {
+  try {
+    const token = socket.handshake.auth && socket.handshake.auth.token;
+    const user = await store.findUserByToken(token);
+    if (!user) return next(new Error('unauthorized'));
+    socket.user = user;
+    next();
+  } catch (e) {
+    next(new Error('unauthorized'));
+  }
+});
 
-  updateUserName: (id, name) => usersCol.updateOne({ id }, { $set: { name } }),
-  setLastSeen: (id, ts) => usersCol.updateOne({ id }, { $set: { lastSeen: ts } }),
-  setToken: (id, token) => usersCol.updateOne({ id }, { $set: { token } }),
+io.on('connection', (socket) => {
+  const user = socket.user;
+  socket.join(user.id); // private room named after the user id
 
-  async addMessage({ from, to, text }) {
-    const msg = { id: newId(), from, to, text, createdAt: Date.now() };
-    await messagesCol.insertOne(msg);
-    return msg;
-  },
+  socket.broadcast.emit('presence', { userId: user.id, online: true });
 
-  conversation: (a, b) =>
-    messagesCol
-      .find({ $or: [{ from: a, to: b }, { from: b, to: a }] }, noId)
-      .sort({ createdAt: 1 })
-      .toArray(),
-};
+  socket.on('message:send', async (payload, ack) => {
+    const { to, text } = payload || {};
+    if (!to || !text) return;
+    const msg = await store.addMessage({ from: user.id, to, text });
+    io.to(to).emit('message:new', msg);
+    if (typeof ack === 'function') ack(msg);
+  });
+
+  socket.on('typing', ({ to, typing }) => {
+    if (to) io.to(to).emit('typing', { from: user.id, typing: !!typing });
+  });
+
+  socket.on('disconnect', async () => {
+    const ts = Date.now();
+    await store.setLastSeen(user.id, ts);
+    socket.broadcast.emit('presence', { userId: user.id, online: false, lastSeen: ts });
+  });
+});
+
+// Connect to MongoDB first, then start listening.
+store
+  .connect()
+  .then(() => {
+    server.listen(PORT, () => {
+      console.log(`sunli-backend listening on http://localhost:${PORT}`);
+    });
+  })
+  .catch((e) => {
+    console.error('Failed to connect to MongoDB:', e);
+    process.exit(1);
+  });
