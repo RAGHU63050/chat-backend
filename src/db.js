@@ -103,6 +103,10 @@ module.exports = {
   deleteMessage: (id) =>
     messagesCol.updateOne({ id }, { $set: { deleted: true, text: '' } }),
 
+  // Who sent me messages that are still not delivered?
+  pendingSenders: (me) =>
+    messagesCol.distinct('from', { to: me, deliveredAt: 0 }),
+
   // Mark every message waiting for 'me' as delivered.
   markAllDelivered: (me) =>
     messagesCol.updateMany(
