@@ -1,4 +1,4 @@
-// Chat backend — REST API + Socket.IO realtime.
+// Sunli — chat backend (REST API + Socket.IO realtime).
 // Run:  npm install  &&  npm start   (listens on PORT, default 3000)
 // Data is stored in MongoDB Atlas (see db.js).
 
@@ -14,27 +14,67 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-const publicUser = (u) => ({ id: u.id, phone: u.phone, name: u.name });
+const publicUser = (u) => ({
+  id: u.id,
+  phone: u.phone,
+  name: u.name,
+  lastSeen: u.lastSeen || 0,
+});
+
+// --- Only Indian mobile numbers are allowed (10 digits, starting 6-9) ---
+function normalizePhone(input) {
+  if (!input) return null;
+  let digits = String(input).replace(/\D/g, '');
+  if (digits.length === 12 && digits.startsWith('91')) digits = digits.slice(2);
+  if (digits.length === 11 && digits.startsWith('0')) digits = digits.slice(1);
+  if (!/^[6-9]\d{9}$/.test(digits)) return null;
+  return '+91' + digits;
+}
 
 // ---------------------------------------------------------------------------
 // REST API
 // ---------------------------------------------------------------------------
 
-app.get('/', (_req, res) => res.json({ ok: true, service: 'chat-backend' }));
+app.get('/', (_req, res) => res.json({ ok: true, service: 'sunli' }));
 
-// Register on first use, or log in if the phone number already exists.
+// Register (new number) or log in (existing number) — always with a password.
 app.post('/api/auth', async (req, res) => {
-  const { phone, name } = req.body || {};
-  if (!phone) return res.status(400).json({ error: 'phone is required' });
+  const body = req.body || {};
+  const phone = normalizePhone(body.phone);
+  const password = String(body.password || '');
+  const name = (body.name || '').trim();
+
+  if (!phone) {
+    return res
+      .status(400)
+      .json({ error: 'Enter a valid Indian mobile number (10 digits).' });
+  }
+  if (password.length < 4) {
+    return res
+      .status(400)
+      .json({ error: 'Password must be at least 4 characters.' });
+  }
 
   let user = await store.findUserByPhone(phone);
+  const isNew = !user;
+
   if (!user) {
-    user = await store.addUser(phone, name || phone);
-  } else if (name && name !== user.name) {
-    await store.updateUserName(user.id, name);
-    user.name = name;
+    // New account
+    user = await store.addUser(phone, name || phone, password);
+  } else {
+    // Existing account — password MUST match
+    if (!store.verifyPassword(password, user.passwordHash)) {
+      return res
+        .status(401)
+        .json({ error: 'Wrong password for this number.' });
+    }
+    if (name && name !== user.name) {
+      await store.updateUserName(user.id, name);
+      user.name = name;
+    }
   }
-  res.json({ token: user.token, user: publicUser(user) });
+
+  res.json({ token: user.token, isNew, user: publicUser(user) });
 });
 
 // Bearer-token middleware.
@@ -48,7 +88,7 @@ async function auth(req, res, next) {
 
 app.get('/api/me', auth, (req, res) => res.json({ user: publicUser(req.user) }));
 
-// Everyone except me — the contact list.
+// Everyone except me — the contact list (includes lastSeen).
 app.get('/api/users', auth, async (req, res) => {
   const users = (await store.allUsersExcept(req.user.id)).map(publicUser);
   res.json({ users });
@@ -90,7 +130,7 @@ io.use(async (socket, next) => {
 
 io.on('connection', (socket) => {
   const user = socket.user;
-  socket.join(user.id); // each user gets a private room named after their id
+  socket.join(user.id); // private room named after the user id
 
   socket.broadcast.emit('presence', { userId: user.id, online: true });
 
@@ -98,16 +138,18 @@ io.on('connection', (socket) => {
     const { to, text } = payload || {};
     if (!to || !text) return;
     const msg = await store.addMessage({ from: user.id, to, text });
-    io.to(to).emit('message:new', msg); // deliver to the recipient
-    if (typeof ack === 'function') ack(msg); // confirm to the sender
+    io.to(to).emit('message:new', msg);
+    if (typeof ack === 'function') ack(msg);
   });
 
   socket.on('typing', ({ to, typing }) => {
     if (to) io.to(to).emit('typing', { from: user.id, typing: !!typing });
   });
 
-  socket.on('disconnect', () => {
-    socket.broadcast.emit('presence', { userId: user.id, online: false });
+  socket.on('disconnect', async () => {
+    const ts = Date.now();
+    await store.setLastSeen(user.id, ts);
+    socket.broadcast.emit('presence', { userId: user.id, online: false, lastSeen: ts });
   });
 });
 
@@ -116,7 +158,7 @@ store
   .connect()
   .then(() => {
     server.listen(PORT, () => {
-      console.log(`chat-backend listening on http://localhost:${PORT}`);
+      console.log(`sunli-backend listening on http://localhost:${PORT}`);
     });
   })
   .catch((e) => {
